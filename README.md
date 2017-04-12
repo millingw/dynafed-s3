@@ -6,5 +6,5 @@ The dynafed software, produced by CERN, provides federation of different end sto
 The aim of this project is to implement a lightweight gateway that will provide a subset of s3 operations on top of an existing dynafed installation, such that a client may use dynafed resources via standard s3 interfaces and not be aware of dynafed-specific information.
 
 ### Funding and organisation
-This project is funded under EUDAT Horizion 2020, work package 9.1
+This project is funded under EUDAT Horizon 2020, work package 9.1
 
