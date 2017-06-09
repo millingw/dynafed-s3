@@ -1,0 +1,3 @@
+BASE_DYNAFED_URL = **
+USERNAME = **
+USERPASS = **
