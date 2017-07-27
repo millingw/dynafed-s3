@@ -35,15 +35,19 @@ def elem2file(elem):
         prop(elem, 'getcontenttype', ''),
     )
 
-
+# TODO - authentication!
 @app.route('/s3/<path:filename>', methods=['GET'])
 def retrieve_file(filename):
+    # TODO - should calculate and return signed url to dynafed
     return redirect(BASE_DYNAFED_URL + filename, 302)
 
 
+# TODO - authentication!
 @app.route('/list/<path:directory>', methods=['GET'])
 def list_directory(directory):
   
+    # note - should we do a listing on a signed url, 
+    # rather than doing basic auth?
     headers = {'Depth': '1'}
     r = requests.request('PROPFIND', BASE_DYNAFED_URL + directory, headers=headers, auth=(USERNAME, USERPASS) )
     
@@ -51,7 +55,9 @@ def list_directory(directory):
     results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
 
     #TODO - convert to S3 ListBucketResult format
+    #can we do the conversion with some fancy xml transform magic?
 
+    # for the moment just dump the listing into a string for test purposes
     str_list = []
     for f in results:
         str_list.append(str(f))
