@@ -6,16 +6,41 @@ import xml.etree.cElementTree as xml
 from collections import namedtuple
 import sys, os, base64, datetime, hashlib, hmac 
 from Crypto.Cipher import AES
+from Crypto import Random
 
 from datetime import datetime
 
 from settings import BASE_DYNAFED_URL
-from settings import ID_TO_KEY, ID_TO_ROLES, AUTH_TOKEN_NAME
+from settings import ID_TO_KEY, ID_TO_ROLES, AUTH_TOKEN_NAME, ENCRYPTION_KEY
 
 
 
 app = Flask(__name__)
 api = Api(app)
+
+
+# encryption / decryption code from stack overflow ...
+# https://stackoverflow.com/questions/12524994/encrypt-decrypt-using-pycrypto-aes-256
+
+BS = 32
+pad = lambda s: s + (BS - len(s) % BS) * chr(BS - len(s) % BS) 
+unpad = lambda s : s[:-ord(s[len(s)-1:])]
+
+class AESCipher:
+    def __init__( self, key ):
+        self.key = key
+
+    def encrypt( self, raw ):
+        raw = pad(raw)
+        iv = Random.new().read( AES.block_size )
+        cipher = AES.new( self.key, AES.MODE_CBC, iv )
+        return base64.b64encode( iv + cipher.encrypt( raw ) ) 
+
+    def decrypt( self, enc ):
+        enc = base64.b64decode(enc)
+        iv = enc[:16]
+        cipher = AES.new(self.key, AES.MODE_CBC, iv )
+        return unpad(cipher.decrypt( enc[16:] ))
 
 
 # WebDAV extraction code based on easywebdav ls method
@@ -171,14 +196,14 @@ def handle_list_all_my_buckets():
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
     user_key = ID_TO_KEY.get(identity)
-    if user_key == None:
+    if user_key is None:
        return "No key found for identity", 403
 
     validate_signature(user_key, processed_header)
     
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
-    if user_roles == None:
+    if user_roles is None:
         return "No roles found", 403
 
     timestamp = datetime.now()
@@ -188,8 +213,10 @@ def handle_list_all_my_buckets():
     # build the security token to be encrypted and sent in the query string
     raw_token = identity + "/" + timestamp_str + "/" + user_roles
 
-    # todo - encrypt the token
-    encrypted_token = raw_token
+    # encrypt the token
+    ciph = AESCipher(ENCRYPTION_KEY)
+    encrypted_token = ciph.encrypt(raw_token)
+    print encrypted_token
 
 
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
@@ -217,7 +244,7 @@ def handle_s3_request(entity):
     try:
        authorization, x_amz_date = get_required_headers(request)
     except Exception, e:
-       return e.message(), 400
+       return str(e), 400
 
     processed_header = None
 
@@ -229,14 +256,14 @@ def handle_s3_request(entity):
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
     user_key = ID_TO_KEY.get(identity)
-    if user_key == None:
+    if user_key is None:
        return "No key found for identity", 403
 
     validate_signature(user_key, processed_header)
     
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
-    if user_roles == None:
+    if user_roles is None:
         return "No roles found", 403
 
     timestamp = datetime.now()
@@ -246,8 +273,11 @@ def handle_s3_request(entity):
     # build the security token to be encrypted and sent in the query string
     raw_token = identity + "/" + timestamp_str + "/" + user_roles
 
-    # TODO: encrypt the token
-    encrypted_token = raw_token
+    # encrypt the token
+    
+    ciph = AESCipher(ENCRYPTION_KEY)
+    encrypted_token = ciph.encrypt(raw_token)
+    print encrypted_token
 
     prefix = request.args.get('prefix')
     delimiter = request.args.get('delimiter')
