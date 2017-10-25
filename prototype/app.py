@@ -81,18 +81,18 @@ def getSignatureKey(key, dateStamp, regionName, serviceName):
 
 def list_directory_as_tuples(path):
 
-       # dynafed will only let us descend one directory level at a time,
-       # 'infinte' depth is not supported  
-       headers = {'Depth': '1'}
+   # dynafed will only let us descend one directory level at a time,
+   # 'infinte' depth is not supported
+   headers = {'Depth': '1'}
 
-       r = requests.request('PROPFIND', path, headers=headers )
-       if r.status_code != 207:
-            return None, r.status_code
+   r = requests.request('PROPFIND', path, headers=headers )
+   if r.status_code != 207:
+        return None, r.status_code
 
-       tree = xml.fromstring(r.content)
-       results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
+   tree = xml.fromstring(r.content)
+   results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
 
-       return results, r.status_code
+   return results, r.status_code
 
 
 
@@ -115,7 +115,7 @@ def process_authorization_header(authorization):
                 credential = split1[1]
           elif 'SignedHeaders' in s:
                 split1 = s.split('=')
-                requestSignedHeaders = split1[1]
+                requestSignedHeaders = split1[1].rstrip(',')
           elif 'Signature' in s:
                 split1 = s.split('=')
                 signature = split1[1]
@@ -139,7 +139,7 @@ def process_authorization_header(authorization):
     result["signed_headers"] = requestSignedHeaders
     result["signature"] = signature
     result["identity"] = identity
-    result["date"] = date
+    result["datestamp"] = date
     result["region"] = region
     result["service"] = service
 
@@ -150,6 +150,7 @@ def get_required_headers(request):
     
     authorization = None
     x_amz_date = None
+    host = None
 
     try:
        authorization = request.headers['Authorization']
@@ -160,18 +161,68 @@ def get_required_headers(request):
        x_amz_date = request.headers['X-Amz-Date']
     except:
        raise Exception("x-amz-date header not found")
+
+    try:
+       host = request.headers['host']
+    except:
+       raise Exception("host header not found")
     
-    return authorization, x_amz_date
+    return authorization, x_amz_date, host
 
 
-def validate_signature(user_key, processed_header):
+def validate_signature(user_key, x_amz_date, host, processed_header, request_method, request_parameters):
    # regenerate the key for the signature checking
-    sig_key = getSignatureKey(user_key, processed_header["date"], processed_header["region"], processed_header["service"])
-    
-    # todo - regenerate the signature and check against supplied signature
-    # todo - check timestamp is valid
 
-    
+    sig_key = getSignatureKey(user_key, processed_header["datestamp"], processed_header["region"], processed_header["service"])
+
+
+    canonical_uri = '/'
+
+    # Step 3: Create the canonical query string. In this example (a GET request),
+    # request parameters are in the query string. Query string values must
+    # be URL-encoded (space=%20). The parameters must be sorted by name.
+    # For this example, the query string is pre-formatted in the request_parameters variable.
+
+    canonical_querystring = request_parameters
+
+   # Step 4: Create the canonical headers and signed headers. Header names
+   # must be trimmed and lowercase, and sorted in code point order from
+   # low to high. Note that there is a trailing \n.
+
+    canonical_headers = 'host:' + host + '\n' + 'x-amz-date:' + x_amz_date + '\n'
+
+   # Step 5: Create the list of signed headers. This lists the headers
+   # in the canonical_headers list, delimited with ";" and in alpha order.
+   # Note: The request can include any headers; canonical_headers and
+   # signed_headers lists those that you want to be included in the 
+   # hash of the request. "Host" and "x-amz-date" are always required.
+
+    signed_headers = 'host;x-amz-date'
+
+   # Step 6: Create payload hash (hash of the request body content). For GET
+   # requests, the payload is an empty string ("").
+
+    payload_hash = hashlib.sha256('').hexdigest()
+
+   # Step 7: Combine elements to create create canonical request
+    canonical_request = request_method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' \
+      + signed_headers + '\n' + payload_hash
+
+
+   # ************* TASK 2: CREATE THE STRING TO SIGN*************
+   # Match the algorithm to the hashing algorithm you use, either SHA-1 or
+   # SHA-256 (recommended)
+    algorithm = processed_header['algorithm']
+    credential_scope = processed_header['datestamp'] + '/' + processed_header['region'] + '/' + processed_header['service'] + '/' + 'aws4_request'
+    string_to_sign = algorithm + '\n' +  x_amz_date + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
+
+    signing_key = getSignatureKey(user_key, processed_header['datestamp'], processed_header['region'], processed_header['service'])
+
+    # Sign the string_to_sign using the signing_key
+    signature = hmac.new(signing_key, (string_to_sign).encode('utf-8'), hashlib.sha256).hexdigest()
+
+    return signature == processed_header['signature']
+
 
 
 @app.route('/', methods=['GET'])
@@ -182,7 +233,7 @@ def handle_list_all_my_buckets():
     x_amz_date = None
 
     try:
-       authorization, x_amz_date = get_required_headers(request)
+       authorization, x_amz_date, host = get_required_headers(request)
     except Exception, e:
        return str(e), 400
 
@@ -192,6 +243,12 @@ def handle_list_all_my_buckets():
        processed_header = process_authorization_header(authorization)
     except:
        return "Could not process authorization header", 500
+
+     # for the moment, we only handle a minimum set of signed header and one algorithm
+    if processed_header['signed_headers'] != 'host;x-amz-date':
+        return "Currently we only handle host;x-amz-date signed headers", 500
+    if processed_header['algorithm'] != 'AWS4-HMAC-SHA256':
+        return "Algorithm must be 'AWS4-HMAC-SHA256'", 500
    
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
@@ -199,24 +256,28 @@ def handle_list_all_my_buckets():
     if user_key is None:
        return "No key found for identity", 403
 
-    validate_signature(user_key, processed_header)
+    validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string)
+
+
+    # signature seems valid, check timestamp hasn't expired
+    # x-amz-date should be in form YYYYMMDDT
+    supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
+    delta = datetime.utcnow() - supplied_timestamp
+    
+    # TODO how long do we allow before expiring a timestamp?
     
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
     if user_roles is None:
         return "No roles found", 403
 
-    timestamp = datetime.now()
-    timestamp_str = datetime.strftime(timestamp, '%a, %d %b %Y %H:%M:%S GMT')
-
-
     # build the security token to be encrypted and sent in the query string
-    raw_token = identity + "/" + timestamp_str + "/" + user_roles
+    raw_token = identity + "/" + x_amz_date + "/" + user_roles
 
     # encrypt the token
     ciph = AESCipher(ENCRYPTION_KEY)
     encrypted_token = ciph.encrypt(raw_token)
-    print encrypted_token
+
 
 
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
@@ -242,7 +303,7 @@ def handle_s3_request(entity):
     x_amz_date = None
 
     try:
-       authorization, x_amz_date = get_required_headers(request)
+       authorization, x_amz_date, host = get_required_headers(request)
     except Exception, e:
        return str(e), 400
 
@@ -252,6 +313,12 @@ def handle_s3_request(entity):
        processed_header = process_authorization_header(authorization)
     except:
        return "Could not process authorization header", 500
+
+    # for the moment, we only handle a minimum set of signed header and one algorithm
+    if processed_header['signed_headers'] != 'host;x-amz-date':
+        return "Currently we only handle host;x-amz-date signed headers", 500
+    if processed_header['algorithm'] != 'AWS4-HMAC-SHA256':
+        return "Algorithm must be 'AWS4-HMAC-SHA256'", 500
    
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
@@ -259,29 +326,36 @@ def handle_s3_request(entity):
     if user_key is None:
        return "No key found for identity", 403
 
-    validate_signature(user_key, processed_header)
+    validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string)
+    
+     # signature seems valid, check timestamp hasn't expired
+    # x-amz-date should be in form YYYYMMDDT
+    supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
+    delta = datetime.utcnow() - supplied_timestamp
+    
+    # TODO how long do we allow before expiring a timestamp?
     
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
     if user_roles is None:
         return "No roles found", 403
 
-    timestamp = datetime.now()
-    timestamp_str = datetime.strftime(timestamp, '%a, %d %b %Y %H:%M:%S GMT')
-
 
     # build the security token to be encrypted and sent in the query string
-    raw_token = identity + "/" + timestamp_str + "/" + user_roles
+    raw_token = identity + "/" + x_amz_date + "/" + user_roles
 
     # encrypt the token
     
     ciph = AESCipher(ENCRYPTION_KEY)
     encrypted_token = ciph.encrypt(raw_token)
-    print encrypted_token
 
-    prefix = request.args.get('prefix')
-    delimiter = request.args.get('delimiter')
-    list_type = request.args.get('list-type')
+
+    list_type = None
+    try:
+        list_type = request.args['list_type']
+    except:
+        list_type = None
+
 
     # if list_type not specified, assume we are looking for an object
     if list_type is None:
@@ -292,6 +366,11 @@ def handle_s3_request(entity):
     if list_type != "2":
 	return Response("Invalid list-type argument, must be 2", 500)
 
+    # note - code does not use these yet;
+    # TODO use them ...
+    prefix = request.args.get('prefix')
+    delimiter = request.args.get('delimiter')
+    list_type = request.args.get('list-type')
 
     # naive version of code, does not handle prefix or delimiter
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
