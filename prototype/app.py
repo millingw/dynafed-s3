@@ -1,10 +1,9 @@
-
 from flask import Flask, redirect, url_for, request, Response, abort
 from flask_restful import Resource, Api
 import requests
 import xml.etree.cElementTree as xml
 from collections import namedtuple
-import sys, os, base64, datetime, hashlib, hmac 
+import sys, os, base64, datetime, hashlib, hmac
 from Crypto.Cipher import AES
 from Crypto import Random
 
@@ -23,7 +22,7 @@ api = Api(app)
 # https://stackoverflow.com/questions/12524994/encrypt-decrypt-using-pycrypto-aes-256
 
 BS = 32
-pad = lambda s: s + (BS - len(s) % BS) * chr(BS - len(s) % BS) 
+pad = lambda s: s + (BS - len(s) % BS) * chr(BS - len(s) % BS)
 unpad = lambda s : s[:-ord(s[len(s)-1:])]
 
 class AESCipher:
@@ -34,7 +33,7 @@ class AESCipher:
         raw = pad(raw)
         iv = Random.new().read( AES.block_size )
         cipher = AES.new( self.key, AES.MODE_CBC, iv )
-        return base64.b64encode( iv + cipher.encrypt( raw ) ) 
+        return base64.b64encode( iv + cipher.encrypt( raw ) )
 
     def decrypt( self, enc ):
         enc = base64.b64decode(enc)
@@ -100,38 +99,40 @@ def list_directory_as_tuples(path):
 # extract the authorization information
 # and return all relevant information as a dict
 def process_authorization_header(authorization):
-    
-    split = authorization.split()
+
+    auth_split = authorization.split(',')
     algorithm = None
     credential = None
     requestSignedHeaders = None
     signature = None
 
-    for s in split:
-          if s == "AWS4-HMAC-SHA256":
-                algorithm = 'AWS4-HMAC-SHA256'
-          elif 'Credential' in s:
-                split1 = s.split('=')
-                credential = split1[1]
-          elif 'SignedHeaders' in s:
-                split1 = s.split('=')
-                requestSignedHeaders = split1[1].rstrip(',')
-          elif 'Signature' in s:
-                split1 = s.split('=')
-                signature = split1[1]
-    
+    # first entry should be the algorithm followed by a space, then the credential
+    if len(auth_split) == 0:
+        raise
+
+    s1 = auth_split[0].split(' ')
+    algorithm = s1[0]
+    credential = s1[1]
     credential_split = credential.split('/')
-    
     identity = None
     date = None
     region = None
     service = None
 
+
     if len(credential_split) > 0:
-          identity = credential_split[0]
+          identity = credential_split[0].split('=')[1]
           date = credential_split[1]
           region = credential_split[2]
           service = credential_split[3]
+
+    for s in auth_split:
+          if 'SignedHeaders' in s:
+                split1 = s.split('=')
+                requestSignedHeaders = split1[1]
+          elif 'Signature' in s:
+                split1 = s.split('=')
+                signature = split1[1]
 
     result = {}
     result["algorithm"] = algorithm
@@ -144,13 +145,18 @@ def process_authorization_header(authorization):
     result["service"] = service
 
     return result
- 
 
+
+# get our minimum set of headers from the request;
+# others may be needed when we get to checking the signature,
+# but we can't even get that far if our minimum set isn't present
+# minimum set here is Authorization, X-Amz-Date and host
 def get_required_headers(request):
-    
+
     authorization = None
     x_amz_date = None
     host = None
+
 
     try:
        authorization = request.headers['Authorization']
@@ -166,7 +172,7 @@ def get_required_headers(request):
        host = request.headers['host']
     except:
        raise Exception("host header not found")
-    
+
     return authorization, x_amz_date, host
 
 
@@ -178,40 +184,36 @@ def validate_signature(user_key, x_amz_date, host, processed_header, request_met
 
     canonical_uri = '/'
 
-    # Step 3: Create the canonical query string. In this example (a GET request),
-    # request parameters are in the query string. Query string values must
-    # be URL-encoded (space=%20). The parameters must be sorted by name.
-    # For this example, the query string is pre-formatted in the request_parameters variable.
+    # Create the canonical query string.
 
     canonical_querystring = request_parameters
+    
 
-   # Step 4: Create the canonical headers and signed headers. Header names
-   # must be trimmed and lowercase, and sorted in code point order from
-   # low to high. Note that there is a trailing \n.
+   # Rebuild the canonical headers from the set of signed headers.
 
-    canonical_headers = 'host:' + host + '\n' + 'x-amz-date:' + x_amz_date + '\n'
+    signed_headers = processed_header['signed_headers']
 
-   # Step 5: Create the list of signed headers. This lists the headers
-   # in the canonical_headers list, delimited with ";" and in alpha order.
-   # Note: The request can include any headers; canonical_headers and
-   # signed_headers lists those that you want to be included in the 
-   # hash of the request. "Host" and "x-amz-date" are always required.
+   # somewhat annoyingly, the signed header names do not map exactly to the actual header properties
+   # only way I can see round this is to iterate and compare everything as lowercase
 
-    signed_headers = 'host;x-amz-date'
+    canonical_headers = ''
+    for s in signed_headers.split(";"):
+        for h in request.headers:
+            if s.lower() == h[0].lower():
+                canonical_headers = canonical_headers + s + ':' + h[1] + '\n'
 
-   # Step 6: Create payload hash (hash of the request body content). For GET
+   # Create payload hash (hash of the request body content). For GET
    # requests, the payload is an empty string ("").
+   # TODO - check the actual content of POST and PUT
 
     payload_hash = hashlib.sha256('').hexdigest()
 
-   # Step 7: Combine elements to create create canonical request
+   # Combine elements to create create canonical request
     canonical_request = request_method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' \
       + signed_headers + '\n' + payload_hash
 
 
-   # ************* TASK 2: CREATE THE STRING TO SIGN*************
-   # Match the algorithm to the hashing algorithm you use, either SHA-1 or
-   # SHA-256 (recommended)
+   # Rebuild the string to sign
     algorithm = processed_header['algorithm']
     credential_scope = processed_header['datestamp'] + '/' + processed_header['region'] + '/' + processed_header['service'] + '/' + 'aws4_request'
     string_to_sign = algorithm + '\n' +  x_amz_date + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
@@ -228,7 +230,7 @@ def validate_signature(user_key, x_amz_date, host, processed_header, request_met
 @app.route('/', methods=['GET'])
 def handle_list_all_my_buckets():
 # list all the 'buckets' available to us and return them as a ListAllBuckets request
- 
+
     authorization = None
     x_amz_date = None
 
@@ -244,28 +246,23 @@ def handle_list_all_my_buckets():
     except:
        return "Could not process authorization header", 500
 
-     # for the moment, we only handle a minimum set of signed header and one algorithm
-    if processed_header['signed_headers'] != 'host;x-amz-date':
-        return "Currently we only handle host;x-amz-date signed headers", 500
-    if processed_header['algorithm'] != 'AWS4-HMAC-SHA256':
-        return "Algorithm must be 'AWS4-HMAC-SHA256'", 500
-   
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
     user_key = ID_TO_KEY.get(identity)
     if user_key is None:
        return "No key found for identity", 403
 
-    validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string)
+    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string) == False:
+        return "signature invalid", 500
 
 
     # signature seems valid, check timestamp hasn't expired
     # x-amz-date should be in form YYYYMMDDT
     supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
     delta = datetime.utcnow() - supplied_timestamp
-    
+
     # TODO how long do we allow before expiring a timestamp?
-    
+
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
     if user_roles is None:
@@ -293,7 +290,7 @@ def handle_list_all_my_buckets():
     response = response + "</Buckets>"
     response = response + "</ListAllMyBucketsResult>"
     return Response(response, mimetype='text/xml')
-     
+
 
 @app.route('/<path:entity>', methods=['GET'])
 def handle_s3_request(entity):
@@ -314,27 +311,23 @@ def handle_s3_request(entity):
     except:
        return "Could not process authorization header", 500
 
-    # for the moment, we only handle a minimum set of signed header and one algorithm
-    if processed_header['signed_headers'] != 'host;x-amz-date':
-        return "Currently we only handle host;x-amz-date signed headers", 500
-    if processed_header['algorithm'] != 'AWS4-HMAC-SHA256':
-        return "Algorithm must be 'AWS4-HMAC-SHA256'", 500
-   
+
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
     user_key = ID_TO_KEY.get(identity)
     if user_key is None:
        return "No key found for identity", 403
 
-    validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string)
-    
+    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string) == False:
+        return "signature invalid", 500
+
      # signature seems valid, check timestamp hasn't expired
     # x-amz-date should be in form YYYYMMDDT
     supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
     delta = datetime.utcnow() - supplied_timestamp
-    
+
     # TODO how long do we allow before expiring a timestamp?
-    
+
     # get the user's roles
     user_roles = ID_TO_ROLES.get(identity)
     if user_roles is None:
@@ -345,7 +338,7 @@ def handle_s3_request(entity):
     raw_token = identity + "/" + x_amz_date + "/" + user_roles
 
     # encrypt the token
-    
+
     ciph = AESCipher(ENCRYPTION_KEY)
     encrypted_token = ciph.encrypt(raw_token)
 
@@ -374,7 +367,7 @@ def handle_s3_request(entity):
 
     # naive version of code, does not handle prefix or delimiter
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
-  
+
     if status_code != 207:
 	return Response("Error calling remote system", status_code)
 
@@ -399,3 +392,6 @@ def handle_s3_request(entity):
 if __name__ == '__main__':
     app.config.from_object('settings')
     app.run(debug=True)
+
+
+
