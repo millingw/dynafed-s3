@@ -78,6 +78,7 @@ def getSignatureKey(key, dateStamp, regionName, serviceName):
     return kSigning
 
 
+
 def list_directory_as_tuples(path):
 
    # dynafed will only let us descend one directory level at a time,
@@ -92,7 +93,6 @@ def list_directory_as_tuples(path):
    results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
 
    return results, r.status_code
-
 
 
 
@@ -126,6 +126,7 @@ def process_authorization_header(authorization):
           region = credential_split[2]
           service = credential_split[3]
 
+
     for s in auth_split:
           if 'SignedHeaders' in s:
                 split1 = s.split('=')
@@ -157,7 +158,6 @@ def get_required_headers(request):
     x_amz_date = None
     host = None
 
-
     try:
        authorization = request.headers['Authorization']
     except:
@@ -176,18 +176,44 @@ def get_required_headers(request):
     return authorization, x_amz_date, host
 
 
-def validate_signature(user_key, x_amz_date, host, processed_header, request_method, request_parameters):
-   # regenerate the key for the signature checking
+def parse_query_parameters(param_string):
 
-    sig_key = getSignatureKey(user_key, processed_header["datestamp"], processed_header["region"], processed_header["service"])
+    if len(param_string) == 0:
+        return ''
+
+    split_params = param_string.split('&')
+
+    # process the params into a dict for sorting
+    param_dict = {}
+    for s in split_params:
+        s1 = s.split('=')
+        if len(s1) == 1:
+            param_dict[s1[0]] = ''
+        else:
+            param_dict[s1[0]] = s1[1]
+
+    # sort by key, ie parameter name
+    keylist = param_dict.keys()
+    keylist.sort()
+
+    # now turn the dict back into a string and return
+    sorted_params = ''
+    i=1
+    for k in keylist:
+        sorted_params = sorted_params + k + '=' + param_dict[k]
+        if i < len(keylist):
+            sorted_params = sorted_params + "&"
+        i = i+1
+
+    return sorted_params
 
 
-    canonical_uri = '/'
+def validate_signature(user_key, x_amz_date, host, processed_header, request_method, request_parameters, canonical_uri):
 
-    # Create the canonical query string.
-
-    canonical_querystring = request_parameters
-    
+    # get the alphabetically sorted query parameters
+    sorted_params = parse_query_parameters(request_parameters)
+    # replace any backslash characters in the params
+    canonical_querystring = sorted_params.replace('/', '%2F')
 
    # Rebuild the canonical headers from the set of signed headers.
 
@@ -212,12 +238,15 @@ def validate_signature(user_key, x_amz_date, host, processed_header, request_met
     canonical_request = request_method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' \
       + signed_headers + '\n' + payload_hash
 
+    #print "Canonical request:" , canonical_request
+
 
    # Rebuild the string to sign
     algorithm = processed_header['algorithm']
     credential_scope = processed_header['datestamp'] + '/' + processed_header['region'] + '/' + processed_header['service'] + '/' + 'aws4_request'
     string_to_sign = algorithm + '\n' +  x_amz_date + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
 
+    # regenerate the key for the signature checking
     signing_key = getSignatureKey(user_key, processed_header['datestamp'], processed_header['region'], processed_header['service'])
 
     # Sign the string_to_sign using the signing_key
@@ -243,8 +272,9 @@ def handle_list_all_my_buckets():
 
     try:
        processed_header = process_authorization_header(authorization)
-    except:
+    except Exception, e:
        return "Could not process authorization header", 500
+
 
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
@@ -252,7 +282,9 @@ def handle_list_all_my_buckets():
     if user_key is None:
        return "No key found for identity", 403
 
-    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string) == False:
+    canonical_uri = "/"
+
+    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string, canonical_uri) == False:
         return "signature invalid", 500
 
 
@@ -283,7 +315,7 @@ def handle_list_all_my_buckets():
     response = response + "<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
     response = response + "<Buckets>"
     for r in results:
-	response = response + "<Bucket>"
+        response = response + "<Bucket>"
         response = response + "<Name>" + r.displayname + "</Name>"
         response = response + "<CreationDate>" + r.mtime + "</CreationDate>"
         response = response + "</Bucket>"
@@ -294,6 +326,7 @@ def handle_list_all_my_buckets():
 
 @app.route('/<path:entity>', methods=['GET'])
 def handle_s3_request(entity):
+
 
 
     authorization = None
@@ -308,7 +341,7 @@ def handle_s3_request(entity):
 
     try:
        processed_header = process_authorization_header(authorization)
-    except:
+    except Exception, e:
        return "Could not process authorization header", 500
 
 
@@ -318,7 +351,12 @@ def handle_s3_request(entity):
     if user_key is None:
        return "No key found for identity", 403
 
-    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string) == False:
+    prefix = request.args.get('prefix')
+    delimiter = request.args.get('delimiter')
+
+    canonical_uri = "/" + entity
+
+    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string, canonical_uri) == False:
         return "signature invalid", 500
 
      # signature seems valid, check timestamp hasn't expired
@@ -342,28 +380,9 @@ def handle_s3_request(entity):
     ciph = AESCipher(ENCRYPTION_KEY)
     encrypted_token = ciph.encrypt(raw_token)
 
-
-    list_type = None
-    try:
-        list_type = request.args['list_type']
-    except:
-        list_type = None
-
-
-    # if list_type not specified, assume we are looking for an object
-    if list_type is None:
+    # delimiter and prefix are none, assuming we are getting an object
+    if ( delimiter is None and prefix is None):
           return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
-
-
-    # AWS documentation says list-type must be '2'
-    if list_type != "2":
-	return Response("Invalid list-type argument, must be 2", 500)
-
-    # note - code does not use these yet;
-    # TODO use them ...
-    prefix = request.args.get('prefix')
-    delimiter = request.args.get('delimiter')
-    list_type = request.args.get('list-type')
 
     # naive version of code, does not handle prefix or delimiter
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
@@ -378,7 +397,7 @@ def handle_s3_request(entity):
     response = response + "<Prefix/>"
     response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
     for r in results:
-	response = response + "<Contents>"
+        response = response + "<Contents>"
         response = response + "<Key>" + r.displayname + "</Key>"
         response = response + "<LastModified>" + r.mtime + "</LastModified>"
         response = response + "<Etag>" + r.etag + "</Etag>"
@@ -386,6 +405,8 @@ def handle_s3_request(entity):
         response = response + "<StorageClass>STANDARD</StorageClass>"
         response = response + "</Contents>"
     response = response + "</ListBucketResult>"
+
+
     return Response(response, mimetype='text/xml')
 
 
