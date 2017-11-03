@@ -3,9 +3,13 @@ from flask_restful import Resource, Api
 import requests
 import xml.etree.cElementTree as xml
 from collections import namedtuple
-import sys, os, base64, datetime, hashlib, hmac
-from Crypto.Cipher import AES
-from Crypto import Random
+import hashlib, hmac
+
+
+from util import AESCipher
+from util import validate_signature
+from util import build_s3_error_response
+from util import check_sig_version
 
 from datetime import datetime
 
@@ -18,28 +22,7 @@ app = Flask(__name__)
 api = Api(app)
 
 
-# encryption / decryption code from stack overflow ...
-# https://stackoverflow.com/questions/12524994/encrypt-decrypt-using-pycrypto-aes-256
 
-BS = 32
-pad = lambda s: s + (BS - len(s) % BS) * chr(BS - len(s) % BS)
-unpad = lambda s : s[:-ord(s[len(s)-1:])]
-
-class AESCipher:
-    def __init__( self, key ):
-        self.key = key
-
-    def encrypt( self, raw ):
-        raw = pad(raw)
-        iv = Random.new().read( AES.block_size )
-        cipher = AES.new( self.key, AES.MODE_CBC, iv )
-        return base64.b64encode( iv + cipher.encrypt( raw ) )
-
-    def decrypt( self, enc ):
-        enc = base64.b64decode(enc)
-        iv = enc[:16]
-        cipher = AES.new(self.key, AES.MODE_CBC, iv )
-        return unpad(cipher.decrypt( enc[16:] ))
 
 
 # WebDAV extraction code based on easywebdav ls method
@@ -54,6 +37,7 @@ def prop(elem, name, default=None):
 
 
 def elem2file(elem):
+
     return File(
         prop(elem, 'href'),
         int(prop(elem, 'getcontentlength', 0)),
@@ -66,30 +50,20 @@ def elem2file(elem):
     )
 
 
-def sign(key, msg):
-    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
-
-
-def getSignatureKey(key, dateStamp, regionName, serviceName):
-    kDate = sign(('AWS4' + key).encode('utf-8'), dateStamp)
-    kRegion = sign(kDate, regionName)
-    kService = sign(kRegion, serviceName)
-    kSigning = sign(kService, 'aws4_request')
-    return kSigning
-
-
-
 def list_directory_as_tuples(path):
 
    # dynafed will only let us descend one directory level at a time,
    # 'infinte' depth is not supported
    headers = {'Depth': '1'}
 
+   print "PATH:", path
+
    r = requests.request('PROPFIND', path, headers=headers )
    if r.status_code != 207:
         return None, r.status_code
 
    tree = xml.fromstring(r.content)
+
    results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
 
    return results, r.status_code
@@ -176,85 +150,6 @@ def get_required_headers(request):
     return authorization, x_amz_date, host
 
 
-def parse_query_parameters(param_string):
-
-    if len(param_string) == 0:
-        return ''
-
-    split_params = param_string.split('&')
-
-    # process the params into a dict for sorting
-    param_dict = {}
-    for s in split_params:
-        s1 = s.split('=')
-        if len(s1) == 1:
-            param_dict[s1[0]] = ''
-        else:
-            param_dict[s1[0]] = s1[1]
-
-    # sort by key, ie parameter name
-    keylist = param_dict.keys()
-    keylist.sort()
-
-    # now turn the dict back into a string and return
-    sorted_params = ''
-    i=1
-    for k in keylist:
-        sorted_params = sorted_params + k + '=' + param_dict[k]
-        if i < len(keylist):
-            sorted_params = sorted_params + "&"
-        i = i+1
-
-    return sorted_params
-
-
-def validate_signature(user_key, x_amz_date, host, processed_header, request_method, request_parameters, canonical_uri):
-
-    # get the alphabetically sorted query parameters
-    sorted_params = parse_query_parameters(request_parameters)
-    # replace any backslash characters in the params
-    canonical_querystring = sorted_params.replace('/', '%2F')
-
-   # Rebuild the canonical headers from the set of signed headers.
-
-    signed_headers = processed_header['signed_headers']
-
-   # somewhat annoyingly, the signed header names do not map exactly to the actual header properties
-   # only way I can see round this is to iterate and compare everything as lowercase
-
-    canonical_headers = ''
-    for s in signed_headers.split(";"):
-        for h in request.headers:
-            if s.lower() == h[0].lower():
-                canonical_headers = canonical_headers + s + ':' + h[1] + '\n'
-
-   # Create payload hash (hash of the request body content). For GET
-   # requests, the payload is an empty string ("").
-   # TODO - check the actual content of POST and PUT
-
-    payload_hash = hashlib.sha256('').hexdigest()
-
-   # Combine elements to create create canonical request
-    canonical_request = request_method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' \
-      + signed_headers + '\n' + payload_hash
-
-    #print "Canonical request:" , canonical_request
-
-
-   # Rebuild the string to sign
-    algorithm = processed_header['algorithm']
-    credential_scope = processed_header['datestamp'] + '/' + processed_header['region'] + '/' + processed_header['service'] + '/' + 'aws4_request'
-    string_to_sign = algorithm + '\n' +  x_amz_date + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
-
-    # regenerate the key for the signature checking
-    signing_key = getSignatureKey(user_key, processed_header['datestamp'], processed_header['region'], processed_header['service'])
-
-    # Sign the string_to_sign using the signing_key
-    signature = hmac.new(signing_key, (string_to_sign).encode('utf-8'), hashlib.sha256).hexdigest()
-
-    return signature == processed_header['signature']
-
-
 
 @app.route('/', methods=['GET'])
 def handle_list_all_my_buckets():
@@ -268,12 +163,16 @@ def handle_list_all_my_buckets():
     except Exception, e:
        return str(e), 400
 
+    if check_sig_version(authorization) == False:
+        return build_s3_error_response("InvalidRequest",
+                "Please use AWS4-HMAC-SHA256","", 0), 400
+
     processed_header = None
 
     try:
        processed_header = process_authorization_header(authorization)
     except Exception, e:
-       return "Could not process authorization header", 500
+       return "Could not process authorization header", 400
 
 
     # should now have the user's identity, look them up in our map
@@ -284,8 +183,9 @@ def handle_list_all_my_buckets():
 
     canonical_uri = "/"
 
-    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string, canonical_uri) == False:
-        return "signature invalid", 500
+    if validate_signature(user_key, x_amz_date, host, processed_header,
+                          request.method, request.query_string, canonical_uri, request.headers) == False:
+        return "signature invalid", 400
 
 
     # signature seems valid, check timestamp hasn't expired
@@ -306,8 +206,6 @@ def handle_list_all_my_buckets():
     # encrypt the token
     ciph = AESCipher(ENCRYPTION_KEY)
     encrypted_token = ciph.encrypt(raw_token)
-
-
 
     results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
 
@@ -335,29 +233,36 @@ def handle_s3_request(entity):
     try:
        authorization, x_amz_date, host = get_required_headers(request)
     except Exception, e:
-       return str(e), 400
+       return build_s3_error_response("MissingSecurityHeader",
+                "mandatory header missing or could not be processed",entity, 0), 400
 
+    if check_sig_version(authorization) == False:
+        return build_s3_error_response("InvalidRequest",
+                "Please use AWS4-HMAC-SHA256","", 0), 400
     processed_header = None
 
     try:
        processed_header = process_authorization_header(authorization)
     except Exception, e:
-       return "Could not process authorization header", 500
+       return "Could not process authorization header", 400
 
 
     # should now have the user's identity, look them up in our map
     identity = processed_header.get("identity")
     user_key = ID_TO_KEY.get(identity)
     if user_key is None:
-       return "No key found for identity", 403
+        return build_s3_error_response("InvalidAccessKeyId",
+                "Identity not recognised",identity, 0), 403
 
     prefix = request.args.get('prefix')
     delimiter = request.args.get('delimiter')
 
     canonical_uri = "/" + entity
 
-    if validate_signature(user_key, x_amz_date, host, processed_header, request.method, request.query_string, canonical_uri) == False:
-        return "signature invalid", 500
+    if validate_signature(user_key, x_amz_date, host, processed_header,
+                          request.method, request.query_string, canonical_uri, request.headers) == False:
+         return build_s3_error_response("SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided.",entity, 0), 403
 
      # signature seems valid, check timestamp hasn't expired
     # x-amz-date should be in form YYYYMMDDT
@@ -382,10 +287,25 @@ def handle_s3_request(entity):
 
     # delimiter and prefix are none, assuming we are getting an object
     if ( delimiter is None and prefix is None):
-          return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
+
+          # check the object exists by issuing a HEAD request and checking the reponse
+
+          response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
+          if response.status_code == 404:
+              return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
+          elif response.status_code == 403:
+              return build_s3_error_response("AccessDenied","Access Denied", entity, 0), 403
+          elif response.status_code != 200:
+              return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
+          else:
+              return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
 
     # naive version of code, does not handle prefix or delimiter
-    results, status_code = list_directory_as_tuples(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
+    path = BASE_DYNAFED_URL + entity
+    if prefix is not None:
+        path = path + prefix
+    path = path + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
+    results, status_code = list_directory_as_tuples(path)
 
     if status_code != 207:
 	return Response("Error calling remote system", status_code)
@@ -394,13 +314,17 @@ def handle_s3_request(entity):
     response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
     response = response + "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
     response = response + "<Name>" + entity + "</Name>"
-    response = response + "<Prefix/>"
+    if prefix is None:
+        response = response + "<Prefix/>"
+    else:
+        response = response + "<Prefix>" + prefix + "</Prefix>"
     response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
     for r in results:
+        print r.etag
         response = response + "<Contents>"
         response = response + "<Key>" + r.displayname + "</Key>"
         response = response + "<LastModified>" + r.mtime + "</LastModified>"
-        response = response + "<Etag>" + r.etag + "</Etag>"
+        response = response + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
         response = response + "<Size>" + str(r.size) + "</Size>"
         response = response + "<StorageClass>STANDARD</StorageClass>"
         response = response + "</Contents>"
