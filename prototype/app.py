@@ -1,9 +1,8 @@
-from flask import Flask, redirect, url_for, request, Response, abort
-from flask_restful import Resource, Api
+from flask import Flask, redirect, request, Response
+from flask_restful import Api
 import requests
 import xml.etree.cElementTree as xml
 from collections import namedtuple
-import hashlib, hmac
 
 
 from util import AESCipher
@@ -56,14 +55,11 @@ def list_directory_as_tuples(path):
    # 'infinte' depth is not supported
    headers = {'Depth': '1'}
 
-   print "PATH:", path
-
-   r = requests.request('PROPFIND', path, headers=headers )
+   r = requests.request('PROPFIND', path, headers=headers)
    if r.status_code != 207:
         return None, r.status_code
 
    tree = xml.fromstring(r.content)
-
    results = [elem2file(elem) for elem in tree.findall('{DAV:}response')]
 
    return results, r.status_code
@@ -234,7 +230,7 @@ def handle_s3_request(entity):
        authorization, x_amz_date, host = get_required_headers(request)
     except Exception, e:
        return build_s3_error_response("MissingSecurityHeader",
-                "mandatory header missing or could not be processed",entity, 0), 400
+                "mandatory header missing or could not be processed", entity, 0), 400
 
     if check_sig_version(authorization) == False:
         return build_s3_error_response("InvalidRequest",
@@ -262,7 +258,7 @@ def handle_s3_request(entity):
     if validate_signature(user_key, x_amz_date, host, processed_header,
                           request.method, request.query_string, canonical_uri, request.headers) == False:
          return build_s3_error_response("SignatureDoesNotMatch",
-                "The request signature we calculated does not match the signature you provided.",entity, 0), 403
+                "The request signature we calculated does not match the signature you provided.", entity, 0), 403
 
      # signature seems valid, check timestamp hasn't expired
     # x-amz-date should be in form YYYYMMDDT
@@ -319,15 +315,23 @@ def handle_s3_request(entity):
     else:
         response = response + "<Prefix>" + prefix + "</Prefix>"
     response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
+
+    # dynafed returns names as /myfed/<entity>/key
+    # so we need to purge some stuff from the front of the name
+
+    purgestring = "/myfed/" + entity
+
+
     for r in results:
-        print r.etag
         response = response + "<Contents>"
-        response = response + "<Key>" + r.displayname + "</Key>"
+        response = response + "<Key>" +  r.name.replace(purgestring, "", 1) + "</Key>"
         response = response + "<LastModified>" + r.mtime + "</LastModified>"
         response = response + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
         response = response + "<Size>" + str(r.size) + "</Size>"
         response = response + "<StorageClass>STANDARD</StorageClass>"
         response = response + "</Contents>"
+
+
     response = response + "</ListBucketResult>"
 
 
