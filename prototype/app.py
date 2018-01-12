@@ -15,13 +15,12 @@ from datetime import datetime
 from settings import BASE_DYNAFED_URL
 from settings import ID_TO_KEY, ID_TO_ROLES, AUTH_TOKEN_NAME, ENCRYPTION_KEY
 
+# buffer size for file streaming (in bytes)
+STREAMING_CHUNK_SIZE = 1024
 
 
 app = Flask(__name__)
 api = Api(app)
-
-
-
 
 
 # WebDAV extraction code based on easywebdav ls method
@@ -215,16 +214,16 @@ def handle_list_all_my_buckets():
         response = response + "</Bucket>"
     response = response + "</Buckets>"
     response = response + "</ListAllMyBucketsResult>"
+
     return Response(response, mimetype='text/xml')
+
+
+
 
 
 @app.route('/<path:entity>', methods=['GET'])
 def handle_s3_request(entity):
 
-
-
-    authorization = None
-    x_amz_date = None
 
     try:
        authorization, x_amz_date, host = get_required_headers(request)
@@ -284,23 +283,41 @@ def handle_s3_request(entity):
     # delimiter and prefix are none, assuming we are getting an object
     if ( delimiter is None and prefix is None):
 
-          # check the object exists by issuing a HEAD request and checking the reponse
 
-          response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
-          if response.status_code == 404:
-              return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
-          elif response.status_code == 403:
-              return build_s3_error_response("AccessDenied","Access Denied", entity, 0), 403
-          elif response.status_code != 200:
-              return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
-          else:
-              return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
+           target_url = BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
 
-    # naive version of code, does not handle prefix or delimiter
-    path = BASE_DYNAFED_URL + entity
-    if prefix is not None:
-        path = path + prefix
+           response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
+           if response.status_code == 404:
+                return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
+           elif response.status_code == 403:
+                return build_s3_error_response("AccessDenied","Access Denied", entity, 0), 403
+           elif response.status_code != 200:
+                return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
+           else:
+                r = requests.get(target_url, stream=True)
+                content_type = r.headers['Content-Type']
+                content_length = r.headers['Content-Length']
+                def downloader():
+                        yield ''
+                        for chunk in r.iter_content(STREAMING_CHUNK_SIZE):
+                                yield chunk
+                return Response(downloader(), mimetype=content_type, headers={ "content-length": content_length})
+
+
+    bucketname = ""
+    # s3cmd appears to add a backslash char to the bucketname,
+    # whereas aws cli does not
+    if entity.endswith('/'):
+        bucketname = entity[:-1]
+    else:
+        bucketname = entity
+
+    path = BASE_DYNAFED_URL + bucketname
+
+    if prefix and prefix.strip():
+        path = path + "/" + prefix
     path = path + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
+
     results, status_code = list_directory_as_tuples(path)
 
     if status_code != 207:
@@ -309,33 +326,63 @@ def handle_s3_request(entity):
 
     response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
     response = response + "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-    response = response + "<Name>" + entity + "</Name>"
-    if prefix is None:
-        response = response + "<Prefix/>"
-    else:
+    response = response + "<Name>" + bucketname + "</Name>"
+    if prefix and prefix.strip():
         response = response + "<Prefix>" + prefix + "</Prefix>"
-    response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
+    else:
+        response = response + "<Prefix/>"
 
-    # dynafed returns names as /myfed/<entity>/key
+    if delimiter is not None:
+        response = response + "<Delimiter>" + delimiter + "</Delimiter>"
+
+
+
+
+    # dynafed returns names as /myfed/<bucketname>/key
     # so we need to purge some stuff from the front of the name
+    purgestring = "/myfed/" + bucketname + "/"
 
-    purgestring = "/myfed/" + entity
+    contents = ""
+    common_prefixes = ""
+    keycount = 0
 
+    compare_dirname = ""
+    if prefix and prefix.strip():
+        compare_dirname = prefix + "/"
 
     for r in results:
-        response = response + "<Contents>"
-        response = response + "<Key>" +  r.name.replace(purgestring, "", 1) + "</Key>"
-        response = response + "<LastModified>" + r.mtime + "</LastModified>"
-        response = response + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
-        response = response + "<Size>" + str(r.size) + "</Size>"
-        response = response + "<StorageClass>STANDARD</StorageClass>"
-        response = response + "</Contents>"
 
+        name = r.name.replace(purgestring, "", 1)
+
+        if r.iscollection == 0:
+              contents = contents + "<Contents>"
+              contents = contents + "<Key>" +  name + "</Key>"
+              contents = contents + "<LastModified>" + r.mtime + "</LastModified>"
+              contents = contents + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
+              contents = contents + "<Size>" + str(r.size) + "</Size>"
+              contents = contents + "<StorageClass>STANDARD</StorageClass>"
+              contents = contents + "</Contents>"
+              keycount = keycount + 1
+        else:
+            # the propfind query can do some strange things,
+            # including returning the name of the directory we actually want to search.
+            # looks weird, so we ignore it if it's supplied
+            if len(name) > 0:
+                  if name != compare_dirname:
+                        common_prefixes = common_prefixes + "<CommonPrefixes><Prefix>"
+                        common_prefixes = common_prefixes + name + "</Prefix></CommonPrefixes>"
+                        keycount = keycount + 1
+
+    response = response + "<KeyCount>" + str(keycount) + "</KeyCount>"
+    if len(contents) > 0:
+        response = response + contents
+    if len(common_prefixes) > 0:
+        response = response + common_prefixes
 
     response = response + "</ListBucketResult>"
-
-
+    
     return Response(response, mimetype='text/xml')
+           
 
 
 if __name__ == '__main__':
