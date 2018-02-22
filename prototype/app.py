@@ -48,6 +48,8 @@ def elem2file(elem):
     )
 
 
+# lists the properties of a path or object in DynaFed's WebDAV interface
+# (there may be better ways to do this ...)
 def list_directory_as_tuples(path):
 
    # dynafed will only let us descend one directory level at a time,
@@ -285,9 +287,10 @@ def handle_s3_request(entity):
     # delimiter and prefix are none, assuming we are getting an object
     if ( delimiter is None and prefix is None):
 
-
+           # build the federated url of the object as accesible via DynaFed
            target_url = BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
 
+	   # get the location, NOT the contents
            response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
            if response.status_code == 404:
                 return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
@@ -296,6 +299,7 @@ def handle_s3_request(entity):
            elif response.status_code != 200:
                 return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
            else:
+		# stream data back to the client, don't read the whole object into memory
                 r = requests.get(target_url, stream=True)
                 content_type = r.headers['Content-Type']
                 content_length = r.headers['Content-Length']
@@ -305,7 +309,7 @@ def handle_s3_request(entity):
                                 yield chunk
                 return Response(downloader(), mimetype=content_type, headers={ "content-length": content_length})
 
-
+    # if we got here we're doing a listing
     bucketname = ""
     # s3cmd appears to add a backslash char to the bucketname,
     # whereas aws cli does not
@@ -325,6 +329,8 @@ def handle_s3_request(entity):
     if status_code != 207:
 	return Response("Error calling remote system", status_code)
 
+    # munge the listing into a formatted S3 response
+    # TODO - use more efficient string handling in what follows
 
     response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
     response = response + "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
@@ -352,6 +358,7 @@ def handle_s3_request(entity):
     if prefix and prefix.strip():
         compare_dirname = prefix + "/"
 
+    
     for r in results:
 
         name = r.name.replace(purgestring, "", 1)
@@ -389,121 +396,121 @@ def handle_s3_request(entity):
 # previous version which tries to issue a redirect to the backend;
 # found not to work due to S3 307 redirect protocol.
 # use handle_s3_request instead!
-def handle_s3_request_redirect(entity):
-
-    authorization = None
-    x_amz_date = None
-
-    try:
-       authorization, x_amz_date, host = get_required_headers(request)
-    except Exception, e:
-       return build_s3_error_response("MissingSecurityHeader",
-                "mandatory header missing or could not be processed", entity, 0), 400
-
-    if check_sig_version(authorization) == False:
-        return build_s3_error_response("InvalidRequest",
-                "Please use AWS4-HMAC-SHA256","", 0), 400
-    processed_header = None
-
-    try:
-       processed_header = process_authorization_header(authorization)
-    except Exception, e:
-       return "Could not process authorization header", 400
-
-
-    # should now have the user's identity, look them up in our map
-    identity = processed_header.get("identity")
-    user_key = ID_TO_KEY.get(identity)
-    if user_key is None:
-        return build_s3_error_response("InvalidAccessKeyId",
-                "Identity not recognised",identity, 0), 403
-
-    prefix = request.args.get('prefix')
-    delimiter = request.args.get('delimiter')
-
-    canonical_uri = "/" + entity
-
-    if validate_signature(user_key, x_amz_date, host, processed_header,
-                          request.method, request.query_string, canonical_uri, request.headers) == False:
-         return build_s3_error_response("SignatureDoesNotMatch",
-                "The request signature we calculated does not match the signature you provided.", entity, 0), 403
-
-     # signature seems valid, check timestamp hasn't expired
-    # x-amz-date should be in form YYYYMMDDT
-    supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
-    delta = datetime.utcnow() - supplied_timestamp
-
-    # TODO how long do we allow before expiring a timestamp?
-
-    # get the user's roles
-    user_roles = ID_TO_ROLES.get(identity)
-    if user_roles is None:
-        return "No roles found", 403
-
-
-    # build the security token to be encrypted and sent in the query string
-    raw_token = identity + "/" + x_amz_date + "/" + user_roles
-
-    # encrypt the token
-
-    ciph = AESCipher(ENCRYPTION_KEY)
-    encrypted_token = ciph.encrypt(raw_token)
-
-    # delimiter and prefix are none, assuming we are getting an object
-    if ( delimiter is None and prefix is None):
-
-          # check the object exists by issuing a HEAD request and checking the reponse
-
-          response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
-          if response.status_code == 404:
-              return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
-          elif response.status_code == 403:
-              return build_s3_error_response("AccessDenied","Access Denied", entity, 0), 403
-          elif response.status_code != 200:
-              return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
-          else:
-              return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
-
-    # naive version of code, does not handle prefix or delimiter
-    path = BASE_DYNAFED_URL + entity
-    if prefix is not None:
-        path = path + prefix
-    path = path + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
-    results, status_code = list_directory_as_tuples(path)
-
-    if status_code != 207:
-	return Response("Error calling remote system", status_code)
-
-
-    response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-    response = response + "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-    response = response + "<Name>" + entity + "</Name>"
-    if prefix is None:
-        response = response + "<Prefix/>"
-    else:
-        response = response + "<Prefix>" + prefix + "</Prefix>"
-    response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
-
-    # dynafed returns names as /myfed/<entity>/key
-    # so we need to purge some stuff from the front of the name
-
-    purgestring = "/myfed/" + entity
-
-
-    for r in results:
-        response = response + "<Contents>"
-        response = response + "<Key>" +  r.name.replace(purgestring, "", 1) + "</Key>"
-        response = response + "<LastModified>" + r.mtime + "</LastModified>"
-        response = response + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
-        response = response + "<Size>" + str(r.size) + "</Size>"
-        response = response + "<StorageClass>STANDARD</StorageClass>"
-        response = response + "</Contents>"
-
-
-    response = response + "</ListBucketResult>"
-
-
-    return Response(response, mimetype='text/xml')
+#def handle_s3_request_redirect(entity):
+#
+#    authorization = None
+#    x_amz_date = None
+#
+#    try:
+#       authorization, x_amz_date, host = get_required_headers(request)
+#    except Exception, e:
+#       return build_s3_error_response("MissingSecurityHeader",
+#                "mandatory header missing or could not be processed", entity, 0), 400
+#
+#    if check_sig_version(authorization) == False:
+#        return build_s3_error_response("InvalidRequest",
+#                "Please use AWS4-HMAC-SHA256","", 0), 400
+#    processed_header = None
+#
+#    try:
+#       processed_header = process_authorization_header(authorization)
+#    except Exception, e:
+#       return "Could not process authorization header", 400
+#
+#
+#    # should now have the user's identity, look them up in our map
+#    identity = processed_header.get("identity")
+#    user_key = ID_TO_KEY.get(identity)
+#    if user_key is None:
+#        return build_s3_error_response("InvalidAccessKeyId",
+#                "Identity not recognised",identity, 0), 403
+#
+#    prefix = request.args.get('prefix')
+#    delimiter = request.args.get('delimiter')
+#
+#    canonical_uri = "/" + entity
+#
+#    if validate_signature(user_key, x_amz_date, host, processed_header,
+#                          request.method, request.query_string, canonical_uri, request.headers) == False:
+#         return build_s3_error_response("SignatureDoesNotMatch",
+#                "The request signature we calculated does not match the signature you provided.", entity, 0), 403
+#
+#     # signature seems valid, check timestamp hasn't expired
+#    # x-amz-date should be in form YYYYMMDDT
+#    supplied_timestamp = datetime.strptime(x_amz_date, "%Y%m%dT%H%M%SZ")
+#    delta = datetime.utcnow() - supplied_timestamp
+#
+#    # TODO how long do we allow before expiring a timestamp?
+#
+#    # get the user's roles
+#    user_roles = ID_TO_ROLES.get(identity)
+#    if user_roles is None:
+#        return "No roles found", 403
+#
+#
+#    # build the security token to be encrypted and sent in the query string
+#    raw_token = identity + "/" + x_amz_date + "/" + user_roles
+#
+#    # encrypt the token
+#
+#    ciph = AESCipher(ENCRYPTION_KEY)
+#    encrypted_token = ciph.encrypt(raw_token)
+#
+#    # delimiter and prefix are none, assuming we are getting an object
+#    if ( delimiter is None and prefix is None):
+#
+#          # check the object exists by issuing a HEAD request and checking the reponse
+#
+#          response = requests.head(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token)
+#          if response.status_code == 404:
+#              return build_s3_error_response("NoSuchKey","Key not found", entity, 0), 404
+#          elif response.status_code == 403:
+#              return build_s3_error_response("AccessDenied","Access Denied", entity, 0), 403
+#          elif response.status_code != 200:
+#              return build_s3_error_response("InternalError","Something bad happened", entity, 0), 500
+#          else:
+#              return redirect(BASE_DYNAFED_URL + entity + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token, 302)
+#
+#    # naive version of code, does not handle prefix or delimiter
+#    path = BASE_DYNAFED_URL + entity
+#    if prefix is not None:
+#        path = path + prefix
+#    path = path + "?" + AUTH_TOKEN_NAME + "=" + encrypted_token
+#    results, status_code = list_directory_as_tuples(path)
+#
+#    if status_code != 207:
+#	return Response("Error calling remote system", status_code)
+#
+#
+#    response = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+#    response = response + "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+#    response = response + "<Name>" + entity + "</Name>"
+#    if prefix is None:
+#        response = response + "<Prefix/>"
+#    else:
+#        response = response + "<Prefix>" + prefix + "</Prefix>"
+#    response = response + "<KeyCount>" + str(len(results)) + "</KeyCount>"
+#
+#    # dynafed returns names as /myfed/<entity>/key
+#    # so we need to purge some stuff from the front of the name
+#
+#    purgestring = "/myfed/" + entity
+#
+#
+#    for r in results:
+#        response = response + "<Contents>"
+#        response = response + "<Key>" +  r.name.replace(purgestring, "", 1) + "</Key>"
+#        response = response + "<LastModified>" + r.mtime + "</LastModified>"
+#        response = response + "<ETag>&quot;" + r.etag + "&quot;</ETag>"
+#        response = response + "<Size>" + str(r.size) + "</Size>"
+#        response = response + "<StorageClass>STANDARD</StorageClass>"
+#        response = response + "</Contents>"
+#
+#
+#    response = response + "</ListBucketResult>"
+#
+#
+#    return Response(response, mimetype='text/xml')
 
 	
 	
